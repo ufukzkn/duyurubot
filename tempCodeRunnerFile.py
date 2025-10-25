@@ -1,1 +1,0 @@
-msg["To"] = TO_EMAIL.split(",") 

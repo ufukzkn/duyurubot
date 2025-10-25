@@ -1,10 +1,10 @@
 # monitor.py
-import os, time, sqlite3, hashlib, logging, threading, requests, smtplib, html, re
-from email.message import EmailMessage
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-import yaml
+import os, time, logging, threading, re, html, yaml, sqlite3
 from dotenv import load_dotenv
+from messaging import send_telegram, answer_callback_query, format_tg
+from mailer import send_email
+from scraper import fetch, fetch_js, needs_js, extract_list_links, filter_links, extract_detail, clean_text
+from subscriptions import init_db, text_hash, get_subscribers, upsert_user, toggle_sub, get_user_subs, add_email, remove_email, list_emails, emails_for_site
 
 # -------------------- ENV / CONFIG --------------------
 load_dotenv()
@@ -13,19 +13,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 if not TELEGRAM_BOT_TOKEN:
     raise SystemExit("TELEGRAM_BOT_TOKEN .env'de yok.")
 
-API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "600"))
 DB_PATH = os.getenv("DB_PATH", "monitor.db")
 
-# E-posta (opsiyonel)
-SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "").strip()
-SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
-FROM_EMAIL = os.getenv("FROM_EMAIL", "").strip()
-TO_EMAIL   = os.getenv("TO_EMAIL", "").strip()
-
-HEADERS = {"User-Agent":"duyuru-monitor/1.4 (+github.com/you)"}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # -------------------- SITES LOADER --------------------
@@ -35,68 +25,16 @@ def load_sites():
     return data["sites"]
 
 # -------------------- DB INIT --------------------
-def init_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+def init_state_tables(conn):
+    # add bot_state if not exists (for update offset)
     cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS seen_item(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        site_url TEXT,
-        item_hash TEXT UNIQUE,
-        title TEXT,
-        url TEXT,
-        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS users(
-        chat_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS user_subs(
-        chat_id INTEGER,
-        site_url TEXT,
-        PRIMARY KEY(chat_id, site_url)
-    )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS bot_state(
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
     conn.commit()
-    return conn
 
 # -------------------- HELPERS --------------------
-def text_hash(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-def http_post_json(url, payload, timeout=20):
-    return requests.post(url, json=payload, timeout=timeout)
-
-def http_get(url, params=None, timeout=30):
-    return requests.get(url, params=params, timeout=timeout)
-
-def send_telegram(chat_id, text, reply_markup=None):
-    data = {"chat_id": chat_id, "text": text, "parse_mode":"HTML", "disable_web_page_preview": True}
-    if reply_markup:
-        data["reply_markup"] = reply_markup
-    try:
-        r = http_post_json(f"{API}/sendMessage", data, timeout=20)
-        if not r.ok:
-            desc = ""
-            try:
-                desc = r.json().get("description","")
-            except:
-                desc = r.text[:200]
-            logging.warning("Telegram send fail %s %s", r.status_code, desc)
-        return r
-    except Exception:
-        logging.exception("Telegram error")
-        return None
-
-def answer_callback_query(cb_id, text=""):
-    try:
-        http_post_json(f"{API}/answerCallbackQuery", {"callback_query_id": cb_id, "text": text}, timeout=10)
-    except Exception:
-        pass
-
 def safe_remove_subscription_on_forbidden(conn, chat_id, site_url, resp):
     try:
         if resp is None:
@@ -109,66 +47,11 @@ def safe_remove_subscription_on_forbidden(conn, chat_id, site_url, resp):
     except Exception:
         logging.exception("Abonelik temizliği sırasında hata")
 
-def send_email(subject: str, body_html: str) -> bool:
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and FROM_EMAIL and TO_EMAIL):
-        return False
-    recipients = [a.strip() for a in TO_EMAIL.split(",") if a.strip()]
-    if not recipients:
-        return False
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = FROM_EMAIL
-    msg["To"] = ", ".join(recipients)
-    msg.set_content("HTML istemcisi olmayanlar için düz metin.")
-    msg.add_alternative(body_html, subtype="html")
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
-            smtp.starttls()
-            smtp.login(SMTP_USER, SMTP_PASS)
-            smtp.send_message(msg, from_addr=FROM_EMAIL, to_addrs=recipients)
-        return True
-    except Exception:
-        logging.exception("SMTP error")
-        return False
+def list_to_markup(items):
+    return "\n".join(f"• {html.escape(x)}" for x in items)
 
-def fetch(url: str) -> str:
-    r = requests.get(url, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    return r.text
-
-def fetch_js(url: str) -> str:
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        b = p.chromium.launch(headless=True)
-        page = b.new_page()
-        page.goto(url, timeout=35000)
-        page.wait_for_timeout(1500)
-        htmlc = page.content()
-        b.close()
-    return htmlc
-
-def needs_js(html_text: str) -> bool:
-    soup = BeautifulSoup(html_text, "html.parser")
-    body_txt = (soup.get_text() or "").strip()
-    scripts = len(soup.find_all("script"))
-    return scripts > 8 and len(body_txt) < 200
-
-def absolute_url(base: str, href: str | None) -> str | None:
-    if not href: return None
-    if href.startswith("http://") or href.startswith("https://"): return href
-    return urljoin(base, href)
-
-def clean_text(s: str, limit=1200) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+\n", "\n", s)
-    s = re.sub(r"[ \t]{2,}", " ", s)
-    return s[:limit]
 
 # -------------------- FORMAT HELPERS --------------------
-TR_MONTHS = {
-    "ocak":1,"şubat":2,"mart":3,"nisan":4,"mayıs":5,"haziran":6,
-    "temmuz":7,"ağustos":8,"eylül":9,"ekim":10,"kasım":11,"aralık":12
-}
 
 def dedupe_lines(text: str) -> str:
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
@@ -182,44 +65,8 @@ def dedupe_lines(text: str) -> str:
         prev_lower = low
     return "\n".join(out)
 
-def try_parse_tr_date(text: str):
-    if not text: return None
-    t = text.lower()
-
-    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}:\d{2}(?::\d{2})?))?", t)
-    if m:
-        d, mo, y = map(int, m.groups()[:3])
-        hhmm = m.group(4) or ""
-        try:
-            date_part = f"{d:02d}.{mo:02d}.{y}"
-            return (date_part + (f" {hhmm}" if hhmm else "")).strip()
-        except:
-            pass
-
-    m = re.search(r"(\d{1,2})\s+([a-zçğıöşü]+)\s+(\d{4})", t, flags=re.I)
-    if m:
-        d = int(m.group(1)); mon = m.group(2).strip(" ,()."); y = int(m.group(3))
-        mon_no = TR_MONTHS.get(mon.lower())
-        if mon_no:
-            return f"{d:02d}.{mon_no:02d}.{y}"
-
-    return None
-
-def format_tg(site_name, title, link, snippet, date_str=None):
-    title = (title or "").strip()
-    snippet = dedupe_lines(snippet or "")
-    preview_lines = [l for l in snippet.splitlines() if l and l.lower() != title.lower()]
-    preview = "\n".join(preview_lines[:3])
-    parts = []
-    parts.append(f"📢 <b>{html.escape(site_name or 'Yeni duyuru')}</b>")
-    parts.append(f"<b>{html.escape(title)}</b>")
-    if date_str:
-        parts.append(f"<i>{html.escape(date_str)}</i>")
-    parts.append(html.escape(link))
-    if preview:
-        parts.append("")
-        parts.append(html.escape(preview))
-    return "\n".join(parts)
+def is_valid_email(addr: str) -> bool:
+    return bool(re.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", addr))
 
 def email_template(site_name, title, link, snippet, date_str=None):
     title = (title or "").strip()
@@ -260,88 +107,10 @@ def email_template(site_name, title, link, snippet, date_str=None):
 """
 
 # -------------------- EXTRACTION --------------------
-def extract_list_links(full_html: str, list_selector: str, item_link_selector: str, base_url: str):
-    soup = BeautifulSoup(full_html, "html.parser")
-    container = soup.select_one(list_selector) if list_selector else soup
-    if not container:
-        return []
-    links = []
-    for a in container.select(item_link_selector):
-        title = a.get_text(strip=True) or ""
-        href  = a.get("href")
-        url   = absolute_url(base_url, href)
-        if not url or len(title) < 5:
-            continue
-        links.append({"title": title, "url": url})
-    seen = set(); uniq = []
-    for it in links:
-        if it["url"] in seen: continue
-        seen.add(it["url"]); uniq.append(it)
-    return uniq
-
-def filter_links(items, include_url_regex=None, exclude_text_regex=None):
-    out = []
-    inc = re.compile(include_url_regex, re.I) if include_url_regex else None
-    exc = re.compile(exclude_text_regex, re.I) if exclude_text_regex else None
-    for it in items:
-        t = it["title"]; u = it["url"]
-        if inc and not inc.search(u): continue
-        if exc and (exc.search(t) or exc.search(u)): continue
-        out.append(it)
-    return out
-
-def extract_detail(html_text: str, detail_selector: str | None):
-    soup = BeautifulSoup(html_text, "html.parser")
-    node = soup.select_one(detail_selector) if detail_selector else None
-    if not node:
-        candidates = soup.select("article, main, .content, .post, .entry, #content, .gdlr-core-single-blog-content, .gdlr-core-blog-content") or [soup.body or soup]
-        node = max(candidates, key=lambda n: len(n.get_text(strip=True)))
-    title = None
-    h = node.find(["h1","h2","h3"]) if node else None
-    if h: title = h.get_text(strip=True)
-
-    # tarih yakalama
-    date_text = None
-    date_node = soup.select_one(".gdlr-core-blog-info-date, .date, time")
-    if date_node:
-        date_text = date_node.get_text(" ", strip=True)
-    else:
-        date_text = try_parse_tr_date(soup.get_text(" ", strip=True))
-    if date_text:
-        parsed = try_parse_tr_date(date_text)
-        if parsed:
-            date_text = parsed
-
-    snippet = node.get_text(separator="\n").strip() if node else soup.get_text(separator="\n").strip()
-    return (title or None), clean_text(snippet, limit=1600), (date_text or None)
-
+# (Tüm çıkarım ve fetch fonksiyonları scraper.py içinde; burada kullanılmıyor.)
+ 
 # -------------------- SUBSCRIPTIONS --------------------
-def get_subscribers(conn, site_url):
-    cur = conn.cursor()
-    cur.execute("SELECT chat_id FROM user_subs WHERE site_url=?", (site_url,))
-    return [row[0] for row in cur.fetchall()]
-
-def upsert_user(conn, chat_id, username):
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users(chat_id, username) VALUES(?,?)", (chat_id, username))
-    conn.commit()
-
-def toggle_sub(conn, chat_id, site_url):
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM user_subs WHERE chat_id=? AND site_url=?", (chat_id, site_url))
-    if cur.fetchone():
-        cur.execute("DELETE FROM user_subs WHERE chat_id=? AND site_url=?", (chat_id, site_url))
-        conn.commit()
-        return False
-    else:
-        cur.execute("INSERT OR IGNORE INTO user_subs(chat_id, site_url) VALUES(?,?)", (chat_id, site_url))
-        conn.commit()
-        return True
-
-def get_user_subs(conn, chat_id):
-    cur = conn.cursor()
-    cur.execute("SELECT site_url FROM user_subs WHERE chat_id=?", (chat_id,))
-    return {row[0] for row in cur.fetchall()}
+# (Abonelik işlemleri subscriptions.py içinde; burada tanımlı değil.)
 
 # -------------------- TELEGRAM UI --------------------
 def sites_keyboard(conn, chat_id, sites):
@@ -372,8 +141,24 @@ def handle_update(conn, upd, sites_by_url):
                 "Takip etmek istediğin siteleri seç/toggle et:",
                 reply_markup=sites_keyboard(conn, chat_id, list(sites_by_url.values()))
             )
+        elif text.startswith("/email"):
+            emails = list_emails(conn, chat_id)
+            info = "Kayıtlı e-posta adreslerin yok." if not emails else ("E-posta adreslerin:\n" + list_to_markup(emails))
+            help_text = "\n\nEkle: email add adres@ornek.com\nSil: email remove adres@ornek.com"
+            send_telegram(chat_id, info + help_text)
+        elif text.lower().startswith("email add "):
+            addr = text.split(" ", 2)[2].strip()
+            if is_valid_email(addr):
+                add_email(conn, chat_id, addr)
+                send_telegram(chat_id, f"✅ Eklendi: <b>{html.escape(addr)}</b>")
+            else:
+                send_telegram(chat_id, "❌ Geçersiz e-posta adresi.")
+        elif text.lower().startswith("email remove "):
+            addr = text.split(" ", 2)[2].strip()
+            remove_email(conn, chat_id, addr)
+            send_telegram(chat_id, f"🗑️ Silindi (varsa): <b>{html.escape(addr)}</b>")
         else:
-            send_telegram(chat_id, "Komutlar: /start, /sites")
+            send_telegram(chat_id, "Komutlar: /start, /sites, /email\n(E-posta ekle/sil: email add/remove)")
 
     elif "callback_query" in upd:
         cb = upd["callback_query"]
@@ -411,7 +196,8 @@ def bot_loop(conn, sites):
     logging.info("Bot loop started.")
     while True:
         try:
-            r = http_get(f"{API}/getUpdates", params={"timeout": 25, "offset": offset+1}, timeout=30)
+            from messaging import http_get
+            r = http_get(f"https://api.telegram.org/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/getUpdates", params={"timeout": 25, "offset": offset+1}, timeout=30)
             if r.ok:
                 data = r.json()
                 for upd in data.get("result", []):
@@ -483,19 +269,24 @@ def process_site(conn, site, notify=True):
             new_count += 1
 
             if notify:
-                # 1) E-postayı abonelerden bağımsız gönder
-                if SMTP_HOST:
-                    em_html = email_template(site.get('name',''), final_title, link, snippet, date_str)
-                    ok_email = send_email(f"Yeni duyuru - {site.get('name')}", em_html)
-                    logging.info("Email gönderimi: %s", "OK" if ok_email else "FAIL")
-
-                # 2) Telegram sadece abone varsa gönderilsin
+                # 1) Telegram sadece abone varsa gönderilsin
                 subscribers = get_subscribers(conn, base)
                 if subscribers:
                     text_msg = format_tg(site.get('name',''), final_title, link, snippet, date_str)
                     for chat_id in subscribers:
                         resp = send_telegram(chat_id, text_msg)
                         safe_remove_subscription_on_forbidden(conn, chat_id, base, resp)
+
+                # 2) E-postayı siteye abone kullanıcıların e-postalarına gönder
+                to_list = emails_for_site(conn, base)
+                # ayrıca .env içindeki TO_EMAIL'i de isteğe bağlı eklemek isteyen olur diye destekleyebiliriz
+                extra_to = (os.getenv("TO_EMAIL") or "").strip()
+                if extra_to:
+                    to_list = sorted(set(to_list + [e.strip() for e in extra_to.split(",") if e.strip()]))
+                if to_list:
+                    em_html = email_template(site.get('name',''), final_title, link, snippet, date_str)
+                    ok_email = send_email(to_list, f"Yeni duyuru - {site.get('name')}", em_html)
+                    logging.info("Email gönderimi: %s (adet=%d)", "OK" if ok_email else "FAIL", len(to_list))
 
         except sqlite3.IntegrityError:
             pass
@@ -517,7 +308,8 @@ def monitor_loop(conn):
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
-    conn = init_db()
+    conn = init_db(DB_PATH)
+    init_state_tables(conn)
     sites = load_sites()
 
     # (opsiyonel) ADMIN_CHAT_ID ile tohumla: /start demeden kayıt ve abonelik eklemek için
