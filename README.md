@@ -2,6 +2,8 @@
 
 Bu proje, belirlediğiniz web sitelerindeki yeni duyuruları periyodik olarak tarar, Telegram botu üzerinden abone olan kullanıcılara gönderir ve isteğe bağlı olarak SMTP ile e‑posta bildirimi yollar. İçerik tekilleştirilir (aynı link ikinci kez gönderilmez) ve basit bir abonelik arayüzü Telegram üzerinden sunulur.
 
+Canlı bot: [@estunotifybot](https://t.me/estunotifybot)
+
 ## Özellikler
 
 - Siteleri statik olarak çeker, gerekli görülürse Playwright ile JS render (opsiyonel fallback)
@@ -111,8 +113,8 @@ python monitor.py
 - /start: Karşılama ve site seçimleri menüsü
 - /sites: Takip etmek istediğiniz siteleri aç/kapat
 - /emails: E‑posta aboneliklerini görüntüle/menü
-- /email add adres@ornek.com
-- /email remove adres@ornek.com
+- `/email add adres@ornek.com`
+- `/email remove adres@ornek.com`
 
 ## Testler
 
@@ -140,7 +142,7 @@ Tüm geçmişi sıfırlamak için `monitor.db` dosyasını silmek yeterli (uyar�
 - JS ağırlıklı sayfa yüklenmiyor:
 	`pip install playwright` ve ardından `python -m playwright install` çalıştırın.
 - E‑posta gelmiyor:
-	SMTP bilgilerini (.env) ve `FROM_EMAIL`/`TO_EMAIL` değerlerini kontrol edin. Loglarda “SMTP error” varsa ayrıntıyı inceleyin.
+  SMTP bilgilerini (.env) ve `FROM_EMAIL`/`TO_EMAIL` değerlerini kontrol edin. Loglarda “SMTP error” varsa ayrıntıyı inceleyin.
 
 ## Mimari özet
 
