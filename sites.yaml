@@ -1,15 +1,10 @@
 sites:
   - name: "Estü Kariyer Birimi"
     url: "https://kariyer.eskisehir.edu.tr/tr/Duyuru"
-    # Liste konteyneri şart değil; doğrudan sayfadan item linkleri seçiyoruz
     list_selector: ""
-    # Başlık ve 'Devamı' linklerini hedefle
     item_link_selector: ".gdlr-core-item-list .gdlr-core-blog-title a, .gdlr-core-item-list .gdlr-core-excerpt-read-more"
-    # Sadece gerçek duyuru detaylarını al
     include_url_regex: "/tr/Duyuru/Detay/"
-    # Menü/çöp metinlerini dışlama (gerek kalmamalı ama dursun)
     exclude_text_regex: "anasayfa|hakkımızda|ekibimiz|organizasyon|faaliyet|komisyon|türkçe|english"
-    # Detay sayfasında metin gövdesi
     detail_selector: ".gdlr-core-single-blog-content, .gdlr-core-blog-content, .gdlr-core-pbf-element"
 
   - name: "Estü Ceng"
