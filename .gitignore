@@ -1,0 +1,7 @@
+.env
+monitor.db
+*.log
+__pycache__/
+*.pyc
+.venv/
+playwright-report/
