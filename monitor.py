@@ -1,3 +1,4 @@
+# monitor.py
 import os, time, sqlite3, hashlib, logging, threading, requests, smtplib, html, re
 from email.message import EmailMessage
 from urllib.parse import urljoin
@@ -5,23 +6,26 @@ from bs4 import BeautifulSoup
 import yaml
 from dotenv import load_dotenv
 
-
 # -------------------- ENV / CONFIG --------------------
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+if not TELEGRAM_BOT_TOKEN:
+    raise SystemExit("TELEGRAM_BOT_TOKEN .env'de yok.")
+
 API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "600"))
 DB_PATH = os.getenv("DB_PATH", "monitor.db")
 
-SMTP_HOST = os.getenv("SMTP_HOST", "")
+# E-posta (opsiyonel)
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-FROM_EMAIL = os.getenv("FROM_EMAIL", "")
-TO_EMAIL   = os.getenv("TO_EMAIL", "")
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
+FROM_EMAIL = os.getenv("FROM_EMAIL", "").strip()
+TO_EMAIL   = os.getenv("TO_EMAIL", "").strip()
 
-HEADERS = {"User-Agent":"duyuru-monitor/1.2 (+github.com/you)"}
+HEADERS = {"User-Agent":"duyuru-monitor/1.4 (+github.com/you)"}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # -------------------- SITES LOADER --------------------
@@ -63,24 +67,47 @@ def init_db():
 def text_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+def http_post_json(url, payload, timeout=20):
+    return requests.post(url, json=payload, timeout=timeout)
+
+def http_get(url, params=None, timeout=30):
+    return requests.get(url, params=params, timeout=timeout)
+
 def send_telegram(chat_id, text, reply_markup=None):
     data = {"chat_id": chat_id, "text": text, "parse_mode":"HTML", "disable_web_page_preview": True}
     if reply_markup:
         data["reply_markup"] = reply_markup
     try:
-        r = requests.post(f"{API}/sendMessage", json=data, timeout=15)
+        r = http_post_json(f"{API}/sendMessage", data, timeout=20)
         if not r.ok:
-            logging.warning("Telegram send fail %s %s", r.status_code, r.text[:200])
-        return r.ok
-    except Exception as e:
+            desc = ""
+            try:
+                desc = r.json().get("description","")
+            except:
+                desc = r.text[:200]
+            logging.warning("Telegram send fail %s %s", r.status_code, desc)
+        return r
+    except Exception:
         logging.exception("Telegram error")
-        return False
+        return None
 
 def answer_callback_query(cb_id, text=""):
     try:
-        requests.post(f"{API}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": text}, timeout=10)
+        http_post_json(f"{API}/answerCallbackQuery", {"callback_query_id": cb_id, "text": text}, timeout=10)
     except Exception:
         pass
+
+def safe_remove_subscription_on_forbidden(conn, chat_id, site_url, resp):
+    try:
+        if resp is None:
+            return
+        if resp.status_code in (400, 403):
+            cur = conn.cursor()
+            cur.execute("DELETE FROM user_subs WHERE chat_id=? AND site_url=?", (chat_id, site_url))
+            conn.commit()
+            logging.info("Abonelik silindi (geçersiz chat): chat_id=%s site=%s", chat_id, site_url)
+    except Exception:
+        logging.exception("Abonelik temizliği sırasında hata")
 
 def send_email(subject: str, body_html: str) -> bool:
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and FROM_EMAIL and TO_EMAIL):
@@ -137,6 +164,101 @@ def clean_text(s: str, limit=1200) -> str:
     s = re.sub(r"[ \t]{2,}", " ", s)
     return s[:limit]
 
+# -------------------- FORMAT HELPERS --------------------
+TR_MONTHS = {
+    "ocak":1,"şubat":2,"mart":3,"nisan":4,"mayıs":5,"haziran":6,
+    "temmuz":7,"ağustos":8,"eylül":9,"ekim":10,"kasım":11,"aralık":12
+}
+
+def dedupe_lines(text: str) -> str:
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    out = []
+    prev_lower = None
+    for l in lines:
+        low = l.lower()
+        if prev_lower == low:
+            continue
+        out.append(l)
+        prev_lower = low
+    return "\n".join(out)
+
+def try_parse_tr_date(text: str):
+    if not text: return None
+    t = text.lower()
+
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}:\d{2}(?::\d{2})?))?", t)
+    if m:
+        d, mo, y = map(int, m.groups()[:3])
+        hhmm = m.group(4) or ""
+        try:
+            date_part = f"{d:02d}.{mo:02d}.{y}"
+            return (date_part + (f" {hhmm}" if hhmm else "")).strip()
+        except:
+            pass
+
+    m = re.search(r"(\d{1,2})\s+([a-zçğıöşü]+)\s+(\d{4})", t, flags=re.I)
+    if m:
+        d = int(m.group(1)); mon = m.group(2).strip(" ,()."); y = int(m.group(3))
+        mon_no = TR_MONTHS.get(mon.lower())
+        if mon_no:
+            return f"{d:02d}.{mon_no:02d}.{y}"
+
+    return None
+
+def format_tg(site_name, title, link, snippet, date_str=None):
+    title = (title or "").strip()
+    snippet = dedupe_lines(snippet or "")
+    preview_lines = [l for l in snippet.splitlines() if l and l.lower() != title.lower()]
+    preview = "\n".join(preview_lines[:3])
+    parts = []
+    parts.append(f"📢 <b>{html.escape(site_name or 'Yeni duyuru')}</b>")
+    parts.append(f"<b>{html.escape(title)}</b>")
+    if date_str:
+        parts.append(f"<i>{html.escape(date_str)}</i>")
+    parts.append(html.escape(link))
+    if preview:
+        parts.append("")
+        parts.append(html.escape(preview))
+    return "\n".join(parts)
+
+def email_template(site_name, title, link, snippet, date_str=None):
+    title = (title or "").strip()
+    snippet = dedupe_lines(snippet or "")
+    preview_lines = [l for l in snippet.splitlines() if l and l.lower() != title.lower()]
+    preview = "\n".join(preview_lines[:12])
+    date_html = f'<div style="color:#6b7280;font-style:italic;margin-top:2px">{html.escape(date_str)}</div>' if date_str else ""
+    return f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f7f7f7">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f7f7f7">
+      <tr><td align="center" style="padding:24px">
+        <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.05);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Ubuntu,'Helvetica Neue',Arial,sans-serif;color:#111827">
+          <tr>
+            <td style="padding:20px 24px;background:#111827;color:#ffffff;font-size:18px;font-weight:600;">
+              {html.escape(site_name or "Yeni duyuru")}
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px">
+              <h1 style="margin:0 0 8px 0;font-size:20px;line-height:1.3;color:#111827">{html.escape(title)}</h1>
+              {date_html}
+              <p style="white-space:pre-wrap;margin:16px 0 20px 0;line-height:1.6;color:#111827">{html.escape(preview)}</p>
+              <a href="{html.escape(link)}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:8px;font-weight:600">İlana git</a>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 24px;color:#6b7280;font-size:12px">
+              Bu e-posta otomatik gönderilmiştir.
+            </td>
+          </tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>
+"""
+
 # -------------------- EXTRACTION --------------------
 def extract_list_links(full_html: str, list_selector: str, item_link_selector: str, base_url: str):
     soup = BeautifulSoup(full_html, "html.parser")
@@ -151,7 +273,6 @@ def extract_list_links(full_html: str, list_selector: str, item_link_selector: s
         if not url or len(title) < 5:
             continue
         links.append({"title": title, "url": url})
-    # dedupe by url
     seen = set(); uniq = []
     for it in links:
         if it["url"] in seen: continue
@@ -178,8 +299,21 @@ def extract_detail(html_text: str, detail_selector: str | None):
     title = None
     h = node.find(["h1","h2","h3"]) if node else None
     if h: title = h.get_text(strip=True)
+
+    # tarih yakalama
+    date_text = None
+    date_node = soup.select_one(".gdlr-core-blog-info-date, .date, time")
+    if date_node:
+        date_text = date_node.get_text(" ", strip=True)
+    else:
+        date_text = try_parse_tr_date(soup.get_text(" ", strip=True))
+    if date_text:
+        parsed = try_parse_tr_date(date_text)
+        if parsed:
+            date_text = parsed
+
     snippet = node.get_text(separator="\n").strip() if node else soup.get_text(separator="\n").strip()
-    return (title or None), clean_text(snippet, limit=1600)
+    return (title or None), clean_text(snippet, limit=1600), (date_text or None)
 
 # -------------------- SUBSCRIPTIONS --------------------
 def get_subscribers(conn, site_url):
@@ -194,7 +328,6 @@ def upsert_user(conn, chat_id, username):
 
 def toggle_sub(conn, chat_id, site_url):
     cur = conn.cursor()
-    # if exists -> remove, else add
     cur.execute("SELECT 1 FROM user_subs WHERE chat_id=? AND site_url=?", (chat_id, site_url))
     if cur.fetchone():
         cur.execute("DELETE FROM user_subs WHERE chat_id=? AND site_url=?", (chat_id, site_url))
@@ -218,7 +351,6 @@ def sites_keyboard(conn, chat_id, sites):
         url = s["url"]; name = s["name"]
         on = "✅" if url in subs else "➕"
         kb.append([{"text": f"{on} {name}", "callback_data": f"tog|{url}"}])
-    # footer
     kb.append([{"text":"📝 Seçili sitelerim", "callback_data":"list"}])
     return {"inline_keyboard": kb}
 
@@ -233,12 +365,12 @@ def handle_update(conn, upd, sites_by_url):
         if text.startswith("/start"):
             send_telegram(chat_id,
                 "Merhaba! 👋 Hangi sitelerden duyuru almak istiyorsun?\nAşağıdan seç/toggle et.",
-                reply_markup={"inline_keyboard": sites_keyboard(conn, chat_id, list(sites_by_url.values()))["inline_keyboard"]}
+                reply_markup=sites_keyboard(conn, chat_id, list(sites_by_url.values()))
             )
         elif text.startswith("/sites"):
             send_telegram(chat_id,
                 "Takip etmek istediğin siteleri seç/toggle et:",
-                reply_markup={"inline_keyboard": sites_keyboard(conn, chat_id, list(sites_by_url.values()))["inline_keyboard"]}
+                reply_markup=sites_keyboard(conn, chat_id, list(sites_by_url.values()))
             )
         else:
             send_telegram(chat_id, "Komutlar: /start, /sites")
@@ -254,7 +386,7 @@ def handle_update(conn, upd, sites_by_url):
             else:
                 names = [sites_by_url[u]["name"] for u in subs if u in sites_by_url]
                 txt = "Seçili sitelerin:\n• " + "\n• ".join(names)
-            answer_callback_query(cb_id, "Liste güncellendi")
+            answer_callback_query(cb_id, "Liste")
             send_telegram(chat_id, txt)
             return
 
@@ -263,17 +395,14 @@ def handle_update(conn, upd, sites_by_url):
             if site_url not in sites_by_url:
                 answer_callback_query(cb_id, "Site bulunamadı")
                 return
-            enabled = toggle_sub(conn, chat_id, site_url)
-            answer_callback_query(cb_id, "Ayar güncellendi")
-            # refresh menu
+            toggle_sub(conn, chat_id, site_url)
+            answer_callback_query(cb_id, "Güncellendi")
             send_telegram(chat_id, "Güncellendi ✔️",
-                reply_markup={"inline_keyboard": sites_keyboard(conn, chat_id, list(sites_by_url.values()))["inline_keyboard"]}
+                reply_markup=sites_keyboard(conn, chat_id, list(sites_by_url.values()))
             )
 
 def bot_loop(conn, sites):
-    # map for quick lookup
     sites_by_url = {s["url"]: s for s in sites}
-    # load/update offset
     cur = conn.cursor()
     cur.execute("SELECT value FROM bot_state WHERE key='update_offset'")
     row = cur.fetchone()
@@ -282,16 +411,14 @@ def bot_loop(conn, sites):
     logging.info("Bot loop started.")
     while True:
         try:
-            r = requests.get(f"{API}/getUpdates", params={"timeout": 25, "offset": offset+1}, timeout=30)
+            r = http_get(f"{API}/getUpdates", params={"timeout": 25, "offset": offset+1}, timeout=30)
             if r.ok:
                 data = r.json()
-                if data.get("ok") and data.get("result"):
-                    for upd in data["result"]:
-                        offset = max(offset, upd["update_id"])
-                        handle_update(conn, upd, sites_by_url)
-                    # save offset
-                    cur.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('update_offset',?)", (str(offset),))
-                    conn.commit()
+                for upd in data.get("result", []):
+                    offset = max(offset, upd["update_id"])
+                    handle_update(conn, upd, sites_by_url)
+                cur.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('update_offset',?)", (str(offset),))
+                conn.commit()
         except Exception:
             logging.exception("Bot loop error")
             time.sleep(2)
@@ -343,10 +470,9 @@ def process_site(conn, site, notify=True):
                 logging.warning("Detay getirilemedi: %s", e)
                 continue
 
-        title_det, body = extract_detail(detail_html, detail_selector)
+        title_det, body, date_str = extract_detail(detail_html, detail_selector)
         final_title = (title_det or title_from_list or "").strip()[:200]
-        snippet = clean_text(body, limit=800)
-        preview = "\n".join(snippet.splitlines()[:2])
+        snippet = clean_text(body, limit=1000)
 
         # Link bazlı tekilleştirme
         h = text_hash(link)
@@ -357,27 +483,21 @@ def process_site(conn, site, notify=True):
             new_count += 1
 
             if notify:
-                subscribers = get_subscribers(conn, base)
-                if not subscribers:
-                    continue
-                safe_title = html.escape(final_title)
-                safe_prev  = html.escape(preview)
-                text = f"📢 <b>{html.escape(site.get('name','Yeni duyuru'))}</b>\n{safe_title}\n{link}\n\n{safe_prev}"
-                for chat_id in subscribers:
-                    send_telegram(chat_id, text)
-
-                # e-posta (opsiyonel)
+                # 1) E-postayı abonelerden bağımsız gönder
                 if SMTP_HOST:
-                    em_html = f"""
-                    <h2>Yeni duyuru: {html.escape(site.get('name',''))}</h2>
-                    <h3>{safe_title}</h3>
-                    <pre style="white-space:pre-wrap">{html.escape(snippet)}</pre>
-                    <p><a href="{html.escape(link)}">İlana git</a></p>
-                    """
-                    send_email(f"Yeni duyuru - {site.get('name')}", em_html)
+                    em_html = email_template(site.get('name',''), final_title, link, snippet, date_str)
+                    ok_email = send_email(f"Yeni duyuru - {site.get('name')}", em_html)
+                    logging.info("Email gönderimi: %s", "OK" if ok_email else "FAIL")
+
+                # 2) Telegram sadece abone varsa gönderilsin
+                subscribers = get_subscribers(conn, base)
+                if subscribers:
+                    text_msg = format_tg(site.get('name',''), final_title, link, snippet, date_str)
+                    for chat_id in subscribers:
+                        resp = send_telegram(chat_id, text_msg)
+                        safe_remove_subscription_on_forbidden(conn, chat_id, base, resp)
 
         except sqlite3.IntegrityError:
-            # zaten görülmüş
             pass
 
     logging.info("Tamam: %s (yeni: %d)", base, new_count)
@@ -397,13 +517,19 @@ def monitor_loop(conn):
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
-    if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN .env'de yok.")
-
     conn = init_db()
     sites = load_sites()
 
-    # Bot ve monitor'u paralel çalıştır
+    # (opsiyonel) ADMIN_CHAT_ID ile tohumla: /start demeden kayıt ve abonelik eklemek için
+    ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+    if ADMIN_CHAT_ID.isdigit():
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO users(chat_id, username) VALUES(?,?)", (int(ADMIN_CHAT_ID), "admin"))
+        for s in sites:
+            cur.execute("INSERT OR IGNORE INTO user_subs(chat_id, site_url) VALUES(?,?)", (int(ADMIN_CHAT_ID), s["url"]))
+        conn.commit()
+        logging.info("ADMIN_CHAT_ID seedlendi ve tüm sitelere abone edildi: %s", ADMIN_CHAT_ID)
+
     t1 = threading.Thread(target=bot_loop, args=(conn, sites), daemon=True)
     t1.start()
 

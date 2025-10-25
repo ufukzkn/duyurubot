@@ -1,7 +1,17 @@
+# Secrets
 .env
+.env.*
+
+# DB / logs / bytecode
 monitor.db
+*.db
+*.sqlite*
 *.log
 __pycache__/
 *.pyc
+*.pyo
+
+# Virtualenv / tools
 .venv/
+.vscode/
 playwright-report/
