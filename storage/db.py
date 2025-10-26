@@ -46,6 +46,23 @@ def set_update_offset(conn, offset: int):
     cur.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('update_offset',?)", (str(offset),))
     conn.commit()
 
+# --- generic bot_state helpers ---
+def get_state(conn, key: str) -> str | None:
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM bot_state WHERE key=?", (key,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+def set_state(conn, key: str, value: str):
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (key, value))
+    conn.commit()
+
+def del_state(conn, key: str):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM bot_state WHERE key=?", (key,))
+    conn.commit()
+
 # --- users & subs ---
 def upsert_user(conn, chat_id: int, username: str):
     cur = conn.cursor()
