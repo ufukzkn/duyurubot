@@ -4,6 +4,7 @@ from config import TELEGRAM_BOT_TOKEN
 from storage.db import (get_update_offset, set_update_offset, upsert_user,
                         toggle_site_sub, get_user_subs, list_emails,
                         add_email, remove_email)
+
 API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 def http_post_json(url, payload, timeout=20):
@@ -32,6 +33,21 @@ def answer_callback_query(cb_id, text=""):
     except Exception:
         pass
 
+def _display_name(obj):
+    """
+    Kullanıcı adı belirler:
+    - username varsa @username
+    - yoksa first_name + last_name
+    - en sonda boş string
+    """
+    if not obj: return ""
+    u = obj.get("username") or ""
+    if u: return u
+    first = obj.get("first_name") or ""
+    last  = obj.get("last_name") or ""
+    full = (first + " " + last).strip()
+    return full
+
 def sites_keyboard(conn, chat_id, sites):
     subs = get_user_subs(conn, chat_id)
     kb = []
@@ -54,17 +70,25 @@ def emails_keyboard(conn, chat_id):
     return "E-posta aboneliklerin:", {"inline_keyboard": rows}
 
 def handle_update(conn, upd, sites_by_url):
+    # --- normal mesaj ---
     if "message" in upd:
         msg = upd["message"]
         chat_id = msg["chat"]["id"]
-        username = msg["from"].get("username") or ""
-        upsert_user(conn, chat_id, username)
+
+        # username üret ve kaydet (boşsa üzerine yazmayacağız; db fonksiyonu hallediyor)
+        uname = _display_name(msg.get("from") or {}) or _display_name(msg.get("chat") or {})
+        upsert_user(conn, chat_id, uname)
 
         text = (msg.get("text","") or "").strip()
         if text.startswith("/start"):
-            send_telegram(chat_id,
+            send_telegram(
+                chat_id,
                 "Merhaba! 👋 Aşağıdan takip etmek istediğin siteleri seçebilirsin.\n\n"
-                "Komutlar: /sites - Siteleri yönet, /emails - E-posta abonelikleri, ",
+                "Komutlar:\n"
+                "/sites – Siteleri yönet\n"
+                "/emails – E‑posta abonelikleri\n"
+                "/email add &lt;e-posta&gt; – E‑posta aboneliği ekle\n"
+                "/email remove &lt;e-posta&gt; – E‑posta aboneliği kaldır",
                 reply_markup=sites_keyboard(conn, chat_id, list(sites_by_url.values()))
             )
         elif text.startswith("/sites"):
@@ -90,32 +114,44 @@ def handle_update(conn, upd, sites_by_url):
         else:
             send_telegram(chat_id, "Komutlar: /start, /sites, /emails, /email add <a>, /email remove <a>")
 
+    # --- inline callback ---
     elif "callback_query" in upd:
         cb = upd["callback_query"]; cb_id = cb["id"]
         data = cb.get("data",""); chat_id = cb["message"]["chat"]["id"]
+
+        # callback'te de kullanıcı kaydını/username'ini tazele
+        uname = _display_name(cb.get("from") or {}) or _display_name(cb.get("message", {}).get("chat") or {})
+        upsert_user(conn, chat_id, uname)
+
         if data == "list":
             subs = get_user_subs(conn, chat_id)
             if not subs: txt = "Seçili siten yok."
             else:
                 names = [sites_by_url[u]["name"] for u in subs if u in sites_by_url]
                 txt = "Seçili sitelerin:\n• " + "\n• ".join(names)
+            kb = {"inline_keyboard": [[{"text": "↩️ Geri", "callback_data": "back"}]]}
             answer_callback_query(cb_id, "Liste")
-            send_telegram(chat_id, txt); return
+            send_telegram(chat_id, txt, reply_markup=kb); return
+
         if data == "emails":
             txt, kb = emails_keyboard(conn, chat_id)
             answer_callback_query(cb_id, "E-posta")
             send_telegram(chat_id, txt, reply_markup=kb); return
+
         if data == "back":
             answer_callback_query(cb_id, "Geri")
             send_telegram(chat_id, "Menü:", reply_markup=sites_keyboard(conn, chat_id, list(sites_by_url.values()))); return
+
         if data == "noop":
             answer_callback_query(cb_id, "Komutu yaz: /email add <adres>"); return
+
         if data.startswith("emailrm|"):
             em = data.split("|",1)[1]
             remove_email(conn, chat_id, em)
             txt, kb = emails_keyboard(conn, chat_id)
             answer_callback_query(cb_id, "Silindi")
             send_telegram(chat_id, txt, reply_markup=kb); return
+
         if data.startswith("tog|"):
             site_url = data.split("|",1)[1]
             if site_url not in sites_by_url:
@@ -136,8 +172,10 @@ def bot_poll_loop(conn, sites, get_updates_fn=http_get, set_off_fn=set_update_of
             if r.ok:
                 data = r.json()
                 for upd in data.get("result", []):
+                    # önce offset'i yükseltip kaydet (aynı update tekrar işlenmesin)
                     offset = max(offset, upd["update_id"])
+                    set_off_fn(conn, offset)
+                    # sonra işle
                     handle_update(conn, upd, sites_by_url)
-                set_off_fn(conn, offset)
         except Exception:
             logging.exception("Bot loop error")

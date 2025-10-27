@@ -1,4 +1,4 @@
-import sqlite3, logging
+import sqlite3, logging, re
 from typing import Iterable, List, Set
 
 def init_db(db_path: str):
@@ -65,8 +65,23 @@ def del_state(conn, key: str):
 
 # --- users & subs ---
 def upsert_user(conn, chat_id: int, username: str):
+    """
+    Kullanıcıyı kaydeder.
+    - İlk kez geliyorsa ekler.
+    - Zaten varsa VE 'username' boş değilse, mevcut kaydı günceller.
+      (Boş gelen değerler var olan değerin üzerine yazmaz.)
+    """
+    username = (username or "").strip()
     cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users(chat_id, username) VALUES(?,?)", (chat_id, username))
+    # SQLite 3.24+ ON CONFLICT DO UPDATE
+    cur.execute("""
+        INSERT INTO users(chat_id, username) VALUES(?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            username = CASE
+                WHEN excluded.username IS NOT NULL AND excluded.username <> '' THEN excluded.username
+                ELSE users.username
+            END
+    """, (chat_id, username))
     conn.commit()
 
 def toggle_site_sub(conn, chat_id: int, site_url: str) -> bool:
@@ -91,14 +106,13 @@ def get_subscribers(conn, site_url: str) -> List[int]:
     return [row[0] for row in cur.fetchall()]
 
 # --- email subs ---
-import re
 EMAIL_RE = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.I)
 
 def add_email(conn, chat_id: int, email: str):
     if not EMAIL_RE.match(email or ""):
         return False, "Geçersiz e-posta adresi."
     cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO email_subs(chat_id, email) VALUES(?,?)", (chat_id, email.lower()))
+    cur.execute("INSERT OR IGNORE INTO email_subs(chat_id, email) VALUES(?,?)", (chat_id, (email or "").lower()))
     conn.commit()
     return True, "E-posta eklendi."
 
