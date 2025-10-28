@@ -10,7 +10,7 @@ monitor.db
 __pycache__/
 *.pyc
 *.pyo
-
+duyurubot.zip
 # Virtualenv / tools
 .venv/
 .vscode/
