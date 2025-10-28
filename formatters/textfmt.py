@@ -1,11 +1,39 @@
-import html, hashlib, re
+import html, hashlib, re, unicodedata, urllib.parse
 
 TR_MONTHS = {
     "ocak":1,"şubat":2,"mart":3,"nisan":4,"mayıs":5,"haziran":6,
     "temmuz":7,"ağustos":8,"eylül":9,"ekim":10,"kasım":11,"aralık":12
 }
 
+def _normalize_url(u: str) -> str:
+    """
+    URL'leri tekilleştirmeye yardımcı basit normalize:
+    - şema/host lower
+    - boş yol -> '/'
+    - utm_* query paramlarını at
+    - unicode NFKC normalize
+    """
+    if not u:
+        return ""
+    parts  = urllib.parse.urlsplit(u)
+    scheme = (parts.scheme or "https").lower()
+    netloc = (parts.netloc or "").lower()
+    path   = parts.path or "/"
+
+    # query: utm_* gibi izleme paramlarını ayıkla (opsiyonel, basit)
+    q_pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    q_pairs = [(k, v) for (k, v) in q_pairs if not k.lower().startswith("utm_")]
+    query   = urllib.parse.urlencode(q_pairs, doseq=True)
+
+    norm = urllib.parse.urlunsplit((scheme, netloc, path, query, ""))  # fragment yok
+    return unicodedata.normalize("NFKC", norm).strip()
+
 def text_hash(s: str) -> str:
+    """
+    DETERMINISTIK hash. Python'un built-in hash()'ini KULLANMA!
+    Link ise URL normalize edilir; değilse metnin kendisi kullanılır.
+    """
+    s = _normalize_url(s or "")
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def clean_text(s: str, limit=1200) -> str:

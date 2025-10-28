@@ -1,139 +1,206 @@
-import sqlite3, logging, re
-from typing import Iterable, List, Set
+# storage/db.py  -- PostgreSQL (psycopg3) uyarlaması
+import os, logging, re
+from typing import Iterable, List, Set, Optional
 
-def init_db(db_path: str):
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS seen_item(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        site_url TEXT,
-        item_hash TEXT UNIQUE,
-        title TEXT,
-        url TEXT,
-        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS users(
-        chat_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS user_subs(
-        chat_id INTEGER,
-        site_url TEXT,
-        PRIMARY KEY(chat_id, site_url)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS email_subs(
-        chat_id INTEGER,
-        email TEXT,
-        PRIMARY KEY(chat_id, email)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS bot_state(
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""")
-    conn.commit()
+import psycopg
+from psycopg.rows import tuple_row
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    # Lambda'da DATABASE_URL şart; lokal geliştirmede env'e koy.
+    raise RuntimeError("DATABASE_URL boş. Neon/Supabase DSN'ini env'e ekleyin.")
+
+EMAIL_RE = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.I)
+
+# --- INIT ---
+def init_db(_db_path_ignored: str = ""):
+    """
+    PostgreSQL'e bağlanır ve tablo şemasını (gerekirse) oluşturur.
+    """
+    conn = psycopg.connect(DATABASE_URL, autocommit=True)
+    with conn.cursor() as cur:
+        # users
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            chat_id    BIGINT PRIMARY KEY,
+            username   TEXT,
+            first_seen TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+
+        # user_subs
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_subs(
+            chat_id  BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+            site_url TEXT   NOT NULL,
+            PRIMARY KEY(chat_id, site_url)
+        );
+        """)
+
+        # email_subs
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS email_subs(
+            chat_id BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+            email   TEXT   NOT NULL,
+            PRIMARY KEY(chat_id, email)
+        );
+        """)
+
+        # seen_item
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS seen_item(
+            id         BIGSERIAL PRIMARY KEY,
+            site_url   TEXT NOT NULL,
+            item_hash  TEXT NOT NULL UNIQUE,
+            title      TEXT,
+            url        TEXT,
+            first_seen TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+
+        # bot_state
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state(
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """)
+
+        # Performans için birkaç index (opsiyonel ama faydalı)
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_seen_item_site ON seen_item(site_url);")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_user_subs_site ON user_subs(site_url);")
     return conn
 
-# --- bot state ---
+
+# --- bot state / offsets ---
 def get_update_offset(conn) -> int:
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM bot_state WHERE key='update_offset'")
-    row = cur.fetchone()
-    return int(row[0]) if row else 0
+    with conn.cursor(row_factory=tuple_row) as cur:
+        cur.execute("SELECT value FROM bot_state WHERE key=%s;", ("update_offset",))
+        row = cur.fetchone()
+        try:
+            return int(row[0]) if row else 0
+        except:
+            return 0
 
 def set_update_offset(conn, offset: int):
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES('update_offset',?)", (str(offset),))
-    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO bot_state(key,value) VALUES(%s,%s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+        """, ("update_offset", str(offset)))
 
-# --- generic bot_state helpers ---
-def get_state(conn, key: str) -> str | None:
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM bot_state WHERE key=?", (key,))
-    row = cur.fetchone()
-    return row[0] if row else None
+
+def get_state(conn, key: str) -> Optional[str]:
+    with conn.cursor(row_factory=tuple_row) as cur:
+        cur.execute("SELECT value FROM bot_state WHERE key=%s;", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
 
 def set_state(conn, key: str, value: str):
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (key, value))
-    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO bot_state(key,value) VALUES(%s,%s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+        """, (key, value))
 
 def del_state(conn, key: str):
-    cur = conn.cursor()
-    cur.execute("DELETE FROM bot_state WHERE key=?", (key,))
-    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM bot_state WHERE key=%s;", (key,))
+
 
 # --- users & subs ---
 def upsert_user(conn, chat_id: int, username: str):
     """
-    Kullanıcıyı kaydeder.
-    - İlk kez geliyorsa ekler.
-    - Zaten varsa VE 'username' boş değilse, mevcut kaydı günceller.
-      (Boş gelen değerler var olan değerin üzerine yazmaz.)
+    İlk kez gelirse ekler. Varsa ve yeni username boş değilse günceller.
     """
     username = (username or "").strip()
-    cur = conn.cursor()
-    # SQLite 3.24+ ON CONFLICT DO UPDATE
-    cur.execute("""
-        INSERT INTO users(chat_id, username) VALUES(?, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            username = CASE
-                WHEN excluded.username IS NOT NULL AND excluded.username <> '' THEN excluded.username
-                ELSE users.username
-            END
-    """, (chat_id, username))
-    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO users(chat_id, username) VALUES (%s, %s)
+            ON CONFLICT (chat_id) DO UPDATE SET
+              username = CASE
+                           WHEN COALESCE(EXCLUDED.username, '') <> '' THEN EXCLUDED.username
+                           ELSE users.username
+                         END;
+        """, (chat_id, username))
 
 def toggle_site_sub(conn, chat_id: int, site_url: str) -> bool:
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM user_subs WHERE chat_id=? AND site_url=?", (chat_id, site_url))
-    if cur.fetchone():
-        cur.execute("DELETE FROM user_subs WHERE chat_id=? AND site_url=?", (chat_id, site_url))
-        conn.commit()
-        return False
-    cur.execute("INSERT OR IGNORE INTO user_subs(chat_id, site_url) VALUES(?,?)", (chat_id, site_url))
-    conn.commit()
-    return True
+    with conn.cursor(row_factory=tuple_row) as cur:
+        cur.execute("SELECT 1 FROM user_subs WHERE chat_id=%s AND site_url=%s;", (chat_id, site_url))
+        exists = cur.fetchone() is not None
+    with conn.cursor() as cur:
+        if exists:
+            cur.execute("DELETE FROM user_subs WHERE chat_id=%s AND site_url=%s;", (chat_id, site_url))
+            return False
+        else:
+            cur.execute("""
+                INSERT INTO user_subs(chat_id, site_url) VALUES(%s,%s)
+                ON CONFLICT DO NOTHING;
+            """, (chat_id, site_url))
+            return True
 
 def get_user_subs(conn, chat_id: int) -> Set[str]:
-    cur = conn.cursor()
-    cur.execute("SELECT site_url FROM user_subs WHERE chat_id=?", (chat_id,))
-    return {row[0] for row in cur.fetchall()}
+    with conn.cursor(row_factory=tuple_row) as cur:
+        cur.execute("SELECT site_url FROM user_subs WHERE chat_id=%s;", (chat_id,))
+        return {row[0] for row in cur.fetchall()}
 
 def get_subscribers(conn, site_url: str) -> List[int]:
-    cur = conn.cursor()
-    cur.execute("SELECT chat_id FROM user_subs WHERE site_url=?", (site_url,))
-    return [row[0] for row in cur.fetchall()]
+    with conn.cursor(row_factory=tuple_row) as cur:
+        cur.execute("SELECT chat_id FROM user_subs WHERE site_url=%s;", (site_url,))
+        return [row[0] for row in cur.fetchall()]
+
 
 # --- email subs ---
-EMAIL_RE = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.I)
-
 def add_email(conn, chat_id: int, email: str):
     if not EMAIL_RE.match(email or ""):
         return False, "Geçersiz e-posta adresi."
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO email_subs(chat_id, email) VALUES(?,?)", (chat_id, (email or "").lower()))
-    conn.commit()
-    return True, "E-posta eklendi."
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO email_subs(chat_id, email) VALUES(%s,%s)
+                ON CONFLICT DO NOTHING;
+            """, (chat_id, (email or "").lower()))
+        return True, "E-posta eklendi."
+    except Exception:
+        logging.exception("add_email")
+        return False, "E-posta eklenemedi."
 
 def remove_email(conn, chat_id: int, email: str):
-    cur = conn.cursor()
-    cur.execute("DELETE FROM email_subs WHERE chat_id=? AND email=?", (chat_id, (email or "").lower()))
-    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM email_subs WHERE chat_id=%s AND email=%s;",
+                    (chat_id, (email or "").lower()))
     return True, "E-posta kaldırıldı."
 
 def list_emails(conn, chat_id: int):
-    cur = conn.cursor()
-    cur.execute("SELECT email FROM email_subs WHERE chat_id=?", (chat_id,))
-    return [row[0] for row in cur.fetchall()]
+    with conn.cursor(row_factory=tuple_row) as cur:
+        cur.execute("SELECT email FROM email_subs WHERE chat_id=%s;", (chat_id,))
+        return [row[0] for row in cur.fetchall()]
+
 
 # --- seen items ---
 def insert_seen(conn, site_url: str, item_hash: str, title: str, url: str) -> bool:
+    """
+    Gerçekten yeni mi önce kontrol et → yeni ise INSERT.
+    Böylece gereksiz INSERT denemeleri sequence'i tüketmez.
+    """
     try:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO seen_item(site_url,item_hash,title,url) VALUES(?,?,?,?)",
-                    (site_url, item_hash, title, url))
+        with conn.cursor() as cur:
+            # URL ya da hash zaten var mı?
+            cur.execute(
+                "SELECT 1 FROM seen_item WHERE url = %s OR item_hash = %s LIMIT 1",
+                (url, item_hash)
+            )
+            if cur.fetchone():
+                return False
+
+            # Gerçekten yeni → ekle
+            cur.execute(
+                "INSERT INTO seen_item(site_url, item_hash, title, url) VALUES (%s, %s, %s, %s)",
+                (site_url, item_hash, title, url)
+            )
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except Exception:
+        conn.rollback()
+        logging.exception("insert_seen failed")
         return False
