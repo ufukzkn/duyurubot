@@ -47,6 +47,14 @@ sites:
     exclude_text_regex: "anasayfa|bölüm|english|türkçe"
     detail_selector: ".gdlr-core-single-blog-content, .gdlr-core-blog-content, .gdlr-core-pbf-element"
 
+  - name: "Fen Fakültesi"
+    url: "https://fen.eskisehir.edu.tr/tr/Duyuru"
+    list_selector: ""
+    item_link_selector: ".gdlr-core-item-list .gdlr-core-blog-title a, .gdlr-core-item-list .gdlr-core-excerpt-read-more"
+    include_url_regex: "/tr/Duyuru/Detay/"
+    exclude_text_regex: "anasayfa|bölüm|english|türkçe"
+    detail_selector: ".gdlr-core-single-blog-content, .gdlr-core-blog-content, .gdlr-core-pbf-element"
+
   - name: "Uluslararası İlişkiler Birimi"
     url: "https://uib.eskisehir.edu.tr/tr/Duyuru"
     list_selector: ""
