@@ -93,23 +93,45 @@ def notify_one_site(conn, site) -> int:
         # E-posta (kullanıcıların kendi kayıtları + opsiyonel global TO_EMAIL)
         if SMTP_HOST:
             email_set = set()
+
+            # 1) Abone e-postalarını çek (psycopg3 için ANY(%s), sqlite için IN (?))
             if subscribers:
-                q = "SELECT email FROM email_subs WHERE chat_id IN ({})".format(
-                    ",".join(["?"] * len(subscribers))
-                )
-                cur = conn.cursor()
-                cur.execute(q, tuple(subscribers))
-                for (em,) in cur.fetchall():
-                    if em:
-                        email_set.add(em)
+                try:
+                    cur = conn.cursor()
+                    try:
+                        # psycopg3 (Postgres) yolu
+                        cur.execute(
+                            "SELECT email FROM email_subs WHERE chat_id = ANY(%s)",
+                            (list(subscribers),)
+                        )
+                    except Exception:
+                        # sqlite geri dönüş yolu
+                        q = "SELECT email FROM email_subs WHERE chat_id IN ({})".format(
+                            ",".join(["?"] * len(subscribers))
+                        )
+                        cur.execute(q, tuple(subscribers))
+                    for row in cur.fetchall():
+                        em = row[0]
+                        if em:
+                            email_set.add(em)
+                except Exception:
+                    logging.exception("email_subs fetch failed")
+
+            # 2) Global TO_EMAIL (virgülle çoklu)
             if TO_EMAIL:
                 for em in [a.strip() for a in TO_EMAIL.split(",") if a.strip()]:
                     email_set.add(em)
+
+            # 3) Gönder
             if email_set:
                 em_html = email_html(site.get("name", ""), final_title, link, snippet, date_str)
                 subject = f"Yeni duyuru - {site.get('name')}"
                 for em in sorted(email_set):
-                    send_email_single(subject, em_html, em)
+                    ok = send_email_single(subject, em_html, em)
+                    if ok:
+                        logging.info("SMTP sent to %s", em)
+                    else:
+                        logging.warning("SMTP send failed to %s", em)
 
     logging.info("Tamam: %s (yeni: %d)", base, new_count)
     return new_count
@@ -138,7 +160,7 @@ def monitor_once(conn) -> int:
         except Exception:
             logging.exception("Site işlenirken hata")
         # Lambda'da genellikle gecikme istemeyiz; gerekiyorsa kaldırılabilir.
-        #time.sleep(1.2)
+        # time.sleep(1.2)
     logging.info("Monitor ONCE bitti. Toplam yeni: %d", total_new)
     return total_new
 
