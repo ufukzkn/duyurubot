@@ -204,3 +204,79 @@ def insert_seen(conn, site_url: str, item_hash: str, title: str, url: str) -> bo
         conn.rollback()
         logging.exception("insert_seen failed")
         return False
+
+def get_last_items_for_user(conn, chat_id: int, limit: int = 5, allowed_site_urls: set[str] | None = None):
+    """
+    Kullanıcının abone olduğu (user_subs) sitelerden en yeni ilanları döndürür.
+    - allowed_site_urls verilirse sadece bu URL'lerle sınırlar.
+    - SQLite ve Postgres (psycopg3) ile çalışır.
+    Dönen: [{site_url, title, url, first_seen}, ...]
+    """
+    cur = conn.cursor()
+
+    if limit is None or limit <= 0:
+        limit = 5
+    if limit > 20:
+        limit = 20
+
+    if allowed_site_urls is not None and len(allowed_site_urls) == 0:
+        return []
+
+    try:
+        # --- Postgres/psycopg3 yolu (paramstyle %s + ANY(%s)) ---
+        if allowed_site_urls is not None:
+            cur.execute(
+                """
+                SELECT s.site_url, s.title, s.url, s.first_seen
+                FROM seen_item s
+                WHERE s.site_url = ANY(%s)
+                  AND EXISTS (SELECT 1 FROM user_subs u WHERE u.chat_id = %s AND u.site_url = s.site_url)
+                ORDER BY s.first_seen DESC
+                LIMIT %s
+                """,
+                (list(allowed_site_urls), chat_id, limit)
+            )
+        else:
+            cur.execute(
+                """
+                SELECT s.site_url, s.title, s.url, s.first_seen
+                FROM seen_item s
+                JOIN user_subs u
+                  ON u.site_url = s.site_url AND u.chat_id = %s
+                ORDER BY s.first_seen DESC
+                LIMIT %s
+                """,
+                (chat_id, limit)
+            )
+        rows = cur.fetchall()
+    except Exception:
+        # --- SQLite yolu (paramstyle ? + IN (...)) ---
+        if allowed_site_urls is not None:
+            placeholders = ",".join(["?"] * len(allowed_site_urls))
+            q = f"""
+                SELECT s.site_url, s.title, s.url, s.first_seen
+                FROM seen_item s
+                WHERE s.site_url IN ({placeholders})
+                  AND EXISTS (SELECT 1 FROM user_subs u WHERE u.chat_id = ? AND u.site_url = s.site_url)
+                ORDER BY s.first_seen DESC
+                LIMIT ?
+            """
+            params = list(allowed_site_urls) + [chat_id, limit]
+            cur.execute(q, tuple(params))
+        else:
+            q = """
+                SELECT s.site_url, s.title, s.url, s.first_seen
+                FROM seen_item s
+                JOIN user_subs u
+                  ON u.site_url = s.site_url
+                WHERE u.chat_id = ?
+                ORDER BY s.first_seen DESC
+                LIMIT ?
+            """
+            cur.execute(q, (chat_id, limit))
+        rows = cur.fetchall()
+
+    return [
+        {"site_url": r[0], "title": r[1], "url": r[2], "first_seen": r[3]}
+        for r in rows
+    ]

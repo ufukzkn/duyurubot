@@ -1,9 +1,9 @@
-import logging, requests
+import logging, requests, html
 from typing import Dict, List, Tuple
 from config import TELEGRAM_BOT_TOKEN
 from storage.db import (get_update_offset, set_update_offset, upsert_user,
                         toggle_site_sub, get_user_subs, list_emails,
-                        add_email, remove_email)
+                        add_email, remove_email, get_last_items_for_user)
 
 API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -57,6 +57,8 @@ def sites_keyboard(conn, chat_id, sites):
         kb.append([{"text": f"{on} {name}", "callback_data": f"tog|{url}"}])
     kb.append([{"text":"📝 Mesaj abonelikleri", "callback_data":"list"}])
     kb.append([{"text":"📧 E-posta abonelikleri", "callback_data":"emails"}])
+    # Yeni: Son duyurular
+    kb.append([{"text":"🕘 Son duyurular", "callback_data":"last"}])
     return {"inline_keyboard": kb}
 
 def emails_keyboard(conn, chat_id):
@@ -88,7 +90,8 @@ def handle_update(conn, upd, sites_by_url):
                 "/sites – Siteleri yönet\n"
                 "/emails – E‑posta abonelikleri\n"
                 "/email add &lt;e-posta&gt; – E‑posta aboneliği ekle\n"
-                "/email remove &lt;e-posta&gt; – E‑posta aboneliği kaldır",
+                "/email remove &lt;e-posta&gt; – E‑posta aboneliği kaldır\n"
+                "/last [n] [site:&lt;anahtar&gt;] – Son n duyuruyu göster (varsayılan n=5)",
                 reply_markup=sites_keyboard(conn, chat_id, list(sites_by_url.values()))
             )
         elif text.startswith("/sites"):
@@ -111,8 +114,68 @@ def handle_update(conn, upd, sites_by_url):
                     send_telegram(chat_id, "Kullanım: /email add <adres> | /email remove <adres>")
             else:
                 send_telegram(chat_id, "Kullanım: /email add <adres> | /email remove <adres>")
+        elif text.startswith("/last"):
+            # /last [n] [site:<anahtar>]
+            parts = text.split()
+            want = 5
+            site_kw = None
+
+            # argümanları tara
+            for p in parts[1:]:
+                low = p.lower()
+                if low.startswith("site:"):
+                    site_kw = p.split(":", 1)[1].strip().lower()
+                else:
+                    try:
+                        want = int(p)
+                    except:
+                        pass
+            if want < 1: want = 1
+            if want > 10: want = 10
+
+            # abone olunan siteler
+            subs = get_user_subs(conn, chat_id)
+            if not subs:
+                send_telegram(chat_id, "Seçili siten yok. Önce /sites ile seçim yap.")
+                return
+
+            # sites_by_url içinden filtre üret (name veya url içinde geçsin)
+            def _match(url: str) -> bool:
+                if not site_kw:
+                    return True
+                site = sites_by_url.get(url) or {}
+                name = (site.get("name") or "").lower()
+                return (site_kw in name) or (site_kw in url.lower())
+
+            allowed = {u for u in subs if _match(u)}
+
+            items = get_last_items_for_user(conn, chat_id, limit=want, allowed_site_urls=allowed if site_kw else None)
+
+            if not items:
+                send_telegram(chat_id, "Uygun duyuru bulunamadı.")
+                return
+
+            # Tek mesajda derle
+            lines = ["🕘 <b>Son duyurular</b>"]
+            for it in items:
+                su = it.get("site_url") or ""
+                nm = (sites_by_url.get(su) or {}).get("name") or su
+                title = it.get("title") or ""
+                url = it.get("url") or ""
+                lines.append(
+                    f"• <b>{html.escape(nm)}</b>\n  <a href=\"{html.escape(url)}\">{html.escape(title)}</a>"
+                )
+
+            if site_kw:
+                lines.insert(1, f"(Filtre: <i>{html.escape(site_kw)}</i>, adet: {len(items)})")
+            else:
+                lines.insert(1, f"Abone olunan son {len(items)} duyuru:")
+
+            # ↩️ Geri butonu (callback_data: back) — mevcut 'back' handler'ı yakalar
+            back_kb = {"inline_keyboard": [[{"text": "↩️ Geri", "callback_data": "back"}]]}
+            send_telegram(chat_id, "\n\n".join(lines), reply_markup=back_kb)
         else:
-            send_telegram(chat_id, "Komutlar: /start, /sites, /emails, /email add <a>, /email remove <a>")
+            send_telegram(chat_id, "Komutlar: /start, /sites, /emails, /email add <a>, /email remove <a>, /last")
 
     # --- inline callback ---
     elif "callback_query" in upd:
@@ -127,8 +190,9 @@ def handle_update(conn, upd, sites_by_url):
             subs = get_user_subs(conn, chat_id)
             if not subs: txt = "Seçili siten yok."
             else:
-                names = [sites_by_url[u]["name"] for u in subs if u in sites_by_url]
-                txt = "Seçili sitelerin:\n• " + "\n• ".join(names)
+                # Kaynak (sites.yaml) sırasını koru
+                names = [s["name"] for s in sites_by_url.values() if s["url"] in subs]
+                txt = "Son duyurularda listelenen ve bildirim almayı seçtiğin sitelerin:\n\n• " + "\n• ".join(names)
             kb = {"inline_keyboard": [[{"text": "↩️ Geri", "callback_data": "back"}]]}
             answer_callback_query(cb_id, "Liste")
             send_telegram(chat_id, txt, reply_markup=kb); return
@@ -161,6 +225,29 @@ def handle_update(conn, upd, sites_by_url):
             send_telegram(chat_id, "Güncellendi ✔️",
                 reply_markup=sites_keyboard(conn, chat_id, list(sites_by_url.values()))
             )
+        if data == "last":
+            answer_callback_query(cb_id, "Son duyurular")
+            # Abone olunan siteler
+            subs = get_user_subs(conn, chat_id)
+            if not subs:
+                send_telegram(chat_id, "Seçili siten yok. Önce /sites ile seçim yap.",
+                              reply_markup={"inline_keyboard": [[{"text":"↩️ Geri","callback_data":"back"}]]})
+                return
+            # Son 5 duyuru (abonelikler join ile zaten filtreli)
+            items = get_last_items_for_user(conn, chat_id, limit=5)
+            if not items:
+                send_telegram(chat_id, "Uygun duyuru bulunamadı.",
+                              reply_markup={"inline_keyboard": [[{"text":"↩️ Geri","callback_data":"back"}]]})
+                return
+            lines = ["🕘 <b>Son duyurular</b>", "Abone olunan son {} duyuru:".format(len(items))]
+            for it in items:
+                su = it.get("site_url") or ""
+                nm = (sites_by_url.get(su) or {}).get("name") or su
+                title = it.get("title") or ""
+                url = it.get("url") or ""
+                lines.append(f"• <b>{html.escape(nm)}</b>\n  <a href=\"{html.escape(url)}\">{html.escape(title)}</a>")
+            back_kb = {"inline_keyboard": [[{"text": "↩️ Geri", "callback_data": "back"}]]}
+            send_telegram(chat_id, "\n\n".join(lines), reply_markup=back_kb); return
 
 def bot_poll_loop(conn, sites, get_updates_fn=http_get, set_off_fn=set_update_offset, get_off_fn=get_update_offset):
     sites_by_url = {s["url"]: s for s in sites}
