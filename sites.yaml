@@ -27,6 +27,20 @@ sites:
     include_url_regex: "/tr/Duyuru/Detay/"
     detail_selector: ".gdlr-core-single-blog-content, .gdlr-core-blog-content, .gdlr-core-pbf-element"
 
+  - name: "Kimya Mühendisliği"
+    url: "https://kimya.eskisehir.edu.tr/tr/Duyuru"
+    list_selector: ""
+    item_link_selector: ".gdlr-core-item-list .gdlr-core-blog-title a, .gdlr-core-item-list .gdlr-core-excerpt-read-more"
+    include_url_regex: "/tr/Duyuru/Detay/"
+    detail_selector: ".gdlr-core-single-blog-content, .gdlr-core-blog-content, .gdlr-core-pbf-element"
+
+  - name: "Makine Mühendisliği"
+    url: "https://makine.eskisehir.edu.tr/Duyuru"
+    list_selector: ""
+    item_link_selector: ".gdlr-core-item-list .gdlr-core-blog-title a, .gdlr-core-item-list .gdlr-core-excerpt-read-more"
+    include_url_regex: "/Duyuru/Detay/"
+    detail_selector: ".gdlr-core-single-blog-content, .gdlr-core-blog-content, .gdlr-core-pbf-element"
+
   - name: "İnşaat Mühendisliği"
     url: "https://insaat.eskisehir.edu.tr/tr/Duyuru"
     list_selector: ""
