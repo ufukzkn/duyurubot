@@ -1,6 +1,8 @@
 # Secrets
 .env
 .env.*
+telegram_id_candidates.txt
+telegram_id_candidates.txt.*.tmp
 vendored/
 # DB / logs / bytecode
 monitor.db

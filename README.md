@@ -32,6 +32,7 @@ storage/
   db.py              # SQLite tablo kurulumları ve CRUD yardımcıları
 
 sites.yaml           # İzlenecek siteler ve seçiciler
+check_telegram_chat.py  # Chat ID'den Telegram username sorgusu
 test_telegram.py     # Telegram gönderim testi
 test_email.py        # SMTP testi
 ```
@@ -54,6 +55,7 @@ python -m playwright install
 
 ```ini
 TELEGRAM_BOT_TOKEN=123456:ABCDEF...
+TELEGRAM_CHAT_ID=123456789,987654321
 CHECK_INTERVAL_SEC=600
 DB_PATH=monitor.db
 
@@ -124,6 +126,34 @@ Hızlı doğrulama için:
 python test_telegram.py   # Telegram test mesajı yollar
 python test_email.py      # SMTP test e‑postası yollar
 ```
+
+`.env` içindeki `TELEGRAM_CHAT_ID` alanında bulunan tüm ID'lerin username bilgisini kontrol etmek için:
+
+```powershell
+python check_telegram_chat.py
+```
+
+Tek bir ID'yi doğrudan sorgulamak da mümkündür: `python check_telegram_chat.py 123456789`.
+Bot yalnızca daha önce iletişim kurduğu veya erişebildiği sohbetleri sorgulayabilir; kullanıcının
+username'i yoksa script bunu ayrıca belirtir.
+
+`.env` içindeki aktif Telegram ID'lerini terminalden seçmek için:
+
+```powershell
+python telegram_id_picker.py
+```
+
+Aday dosyasına her satırda yalnızca bir Chat ID yazabilirsiniz. Picker açılırken ham ID'leri
+Telegram'dan sorgulayıp `@username=ChatID` biçimine otomatik dönüştürür. Bu işlemi menüyü açmadan
+ayrıca çalıştırmak için `python parse_telegram_candidates.py` komutunu kullanabilirsiniz. Username
+yoksa görünen ad veya grup başlığı kullanılır. Kişisel aday dosyası Git tarafından yok sayılır.
+Menüde numaraları girerek seçimleri açıp kapatabilir, `s` ile seçili ID'leri `.env` içindeki
+`TELEGRAM_CHAT_ID` alanına kaydedebilirsiniz.
+Yalnızca `.env` içinde bulunup aday TXT dosyasında olmayan ID'ler de açılışta geçici olarak
+sorgulanır ve menüde ayrı bir başlık altında isimleriyle gösterilir; bu isimler TXT dosyasına
+kaydedilmez.
+Seçimler değiştiyse `q` ile kaydetmeden çıkarken yanlışlıkla değişiklikleri kaybetmemek için
+ayrıca onay istenir; seçimlerde değişiklik yoksa doğrudan çıkılır.
 
 ## Veritabanı ve kalıcılık
 
