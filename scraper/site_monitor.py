@@ -1,4 +1,5 @@
 import yaml, logging, re
+from datetime import datetime
 from bs4 import BeautifulSoup
 from typing import Dict, List, Tuple
 from scraper.fetcher import fetch, fetch_js, needs_js, absolute_url
@@ -16,7 +17,8 @@ def extract_list_links(full_html: str, list_selector: str, item_link_selector: s
         return []
     links = []
     for a in container.select(item_link_selector):
-        title = a.get_text(strip=True) or ""
+        title_node = a.select_one('.estu-announcement-item__body > strong')
+        title = (title_node or a).get_text(' ', strip=True) or ""
         href  = a.get("href")
         url   = absolute_url(base_url, href)
         if not url or len(title) < 5: continue
@@ -40,7 +42,9 @@ def filter_links(items, include_url_regex=None, exclude_text_regex=None):
 
 def extract_detail(html_text: str, detail_selector: str | None):
     soup = BeautifulSoup(html_text, "html.parser")
-    node = soup.select_one(detail_selector) if detail_selector else None
+    node = soup.select_one('article.estu-content-panel')
+    if node is None:
+        node = soup.select_one(detail_selector) if detail_selector else None
     if not node:
         candidates = soup.select("article, main, .content, .post, .entry, #content, .gdlr-core-single-blog-content, .gdlr-core-blog-content") or [soup.body or soup]
         node = max(candidates, key=lambda n: len(n.get_text(strip=True)))
@@ -51,16 +55,24 @@ def extract_detail(html_text: str, detail_selector: str | None):
 
     # tarih
     date_text = None
-    date_node = soup.select_one(".gdlr-core-blog-info-date, .date, time")
+    date_node = node.select_one(".estu-detail-meta time, .gdlr-core-blog-info-date, .date, time")
+    if date_node is None:
+        date_node = soup.select_one(".gdlr-core-blog-info-date, .date, time")
     if date_node:
         date_text = date_node.get_text(" ", strip=True)
+        if date_node.get('datetime'):
+            try:
+                date_text = datetime.fromisoformat(date_node['datetime']).strftime('%d.%m.%Y')
+            except ValueError:
+                pass
     else:
-        date_text = try_parse_tr_date(soup.get_text(" ", strip=True))
+        date_text = try_parse_tr_date(node.get_text(" ", strip=True))
     if date_text:
         parsed = try_parse_tr_date(date_text)
         if parsed: date_text = parsed
 
-    snippet = node.get_text(separator="\n").strip() if node else soup.get_text(separator="\n").strip()
+    body = node.select_one('.estu-content-body')
+    snippet = (body or node).get_text(separator="\n").strip()
     return (title or None), clean_text(snippet, limit=1600), (date_text or None)
 
 def fetch_list_html(url: str):
